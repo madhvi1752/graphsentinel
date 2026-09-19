@@ -1,0 +1,651 @@
+import numpy as np
+import pandas as pd
+import networkx as nx
+import streamlit as st
+
+from dataclasses import dataclass
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import precision_score, recall_score, f1_score
+import plotly.express as px
+
+
+# ============================================================
+# 1. DETECTION RESULT
+# ============================================================
+
+@dataclass
+class DetectionResult:
+    timestamp: int
+    node: str
+    temporal_score: float
+    graph_score: float
+    final_score: float
+    is_anomaly: bool
+    reason: str
+
+
+# ============================================================
+# 2. SYNTHETIC DATA GENERATION
+# ============================================================
+
+def generate_data(
+    seed=42,
+    time_steps=120,
+    node_count=15
+):
+    np.random.seed(seed)
+
+    nodes = [
+        f"node_{i}"
+        for i in range(node_count)
+    ]
+
+    records = []
+
+    for timestamp in range(time_steps):
+
+        for node in nodes:
+
+            value = np.random.normal(
+                loc=50,
+                scale=5
+            )
+
+            # Inject artificial anomalies
+            if 80 <= timestamp <= 88:
+                if node in ["node_3", "node_7"]:
+                    value += np.random.normal(
+                        loc=35,
+                        scale=5
+                    )
+
+            records.append({
+                "timestamp": timestamp,
+                "node": node,
+                "value": value
+            })
+
+    data = pd.DataFrame(records)
+
+    return data
+
+
+# ============================================================
+# 3. DYNAMIC GRAPH GENERATION
+# ============================================================
+
+def generate_graph_features(
+    data,
+    seed=42
+):
+    np.random.seed(seed)
+
+    graph_records = []
+
+    timestamps = data["timestamp"].unique()
+    nodes = data["node"].unique()
+
+    for timestamp in timestamps:
+
+        graph = nx.gnp_random_graph(
+            n=len(nodes),
+            p=0.2,
+            seed=int(timestamp),
+            directed=True
+        )
+
+        mapping = {
+            index: node
+            for index, node in enumerate(nodes)
+        }
+
+        graph = nx.relabel_nodes(
+            graph,
+            mapping
+        )
+
+        for node in nodes:
+
+            graph_records.append({
+                "timestamp": timestamp,
+                "node": node,
+                "degree": graph.degree(node),
+                "in_degree": graph.in_degree(node),
+                "out_degree": graph.out_degree(node)
+            })
+
+    return pd.DataFrame(graph_records)
+
+
+# ============================================================
+# 4. TEMPORAL ANOMALY DETECTION AGENT
+# ============================================================
+
+def calculate_temporal_scores(data):
+
+    data = data.copy()
+
+    data["rolling_mean"] = (
+        data
+        .groupby("node")["value"]
+        .transform(
+            lambda x: x.rolling(
+                window=10,
+                min_periods=3
+            ).mean()
+        )
+    )
+
+    data["rolling_std"] = (
+        data
+        .groupby("node")["value"]
+        .transform(
+            lambda x: x.rolling(
+                window=10,
+                min_periods=3
+            ).std()
+        )
+    )
+
+    data["rolling_std"] = (
+        data["rolling_std"]
+        .replace(0, 1)
+        .fillna(1)
+    )
+
+    data["temporal_score"] = abs(
+        data["value"] - data["rolling_mean"]
+    ) / data["rolling_std"]
+
+    data["temporal_score"] = (
+        data["temporal_score"]
+        .replace([np.inf, -np.inf], 0)
+        .fillna(0)
+    )
+
+    # Normalize scores between 0 and 1
+    max_score = data["temporal_score"].max()
+
+    if max_score > 0:
+        data["temporal_score"] = (
+            data["temporal_score"] / max_score
+        )
+
+    return data
+
+
+# ============================================================
+# 5. GRAPH ANOMALY DETECTION AGENT
+# ============================================================
+
+def calculate_graph_scores(graph_data):
+
+    graph_data = graph_data.copy()
+
+    features = graph_data[
+        [
+            "degree",
+            "in_degree",
+            "out_degree"
+        ]
+    ]
+
+    model = IsolationForest(
+        contamination=0.05,
+        random_state=42
+    )
+
+    predictions = model.fit_predict(features)
+
+    graph_data["graph_score"] = np.where(
+        predictions == -1,
+        1.0,
+        0.0
+    )
+
+    return graph_data
+
+
+# ============================================================
+# 6. MULTI-AGENT SCORE FUSION
+# ============================================================
+
+def combine_scores(
+    temporal_data,
+    graph_data,
+    temporal_weight=0.7
+):
+
+    merged = pd.merge(
+        temporal_data,
+        graph_data,
+        on=["timestamp", "node"],
+        how="inner"
+    )
+
+    graph_weight = 1 - temporal_weight
+
+    merged["final_score"] = (
+        temporal_weight
+        * merged["temporal_score"]
+        + graph_weight
+        * merged["graph_score"]
+    )
+
+    return merged
+
+
+# ============================================================
+# 7. INVESTIGATION AGENT
+# ============================================================
+
+def investigate_anomalies(
+    data,
+    threshold
+):
+
+    results = []
+
+    for _, row in data.iterrows():
+
+        is_anomaly = (
+            row["final_score"] >= threshold
+        )
+
+        reasons = []
+
+        if row["temporal_score"] > 0.5:
+            reasons.append(
+                "Unusual temporal behavior"
+            )
+
+        if row["graph_score"] > 0:
+            reasons.append(
+                "Unusual graph behavior"
+            )
+
+        if len(reasons) == 0:
+            reasons.append(
+                "Normal behavior"
+            )
+
+        result = DetectionResult(
+            timestamp=int(row["timestamp"]),
+            node=row["node"],
+            temporal_score=round(
+                float(row["temporal_score"]),
+                4
+            ),
+            graph_score=round(
+                float(row["graph_score"]),
+                4
+            ),
+            final_score=round(
+                float(row["final_score"]),
+                4
+            ),
+            is_anomaly=bool(is_anomaly),
+            reason=", ".join(reasons)
+        )
+
+        results.append(result)
+
+    return results
+
+
+# ============================================================
+# 8. SYNTHETIC GROUND TRUTH
+# ============================================================
+
+def create_ground_truth(data):
+
+    ground_truth = []
+
+    for _, row in data.iterrows():
+
+        is_real_anomaly = (
+            80 <= row["timestamp"] <= 88
+            and row["node"] in [
+                "node_3",
+                "node_7"
+            ]
+        )
+
+        ground_truth.append(
+            int(is_real_anomaly)
+        )
+
+    return np.array(ground_truth)
+
+
+# ============================================================
+# 9. EVALUATION AGENT
+# ============================================================
+
+def evaluate_model(
+    data,
+    threshold
+):
+
+    predictions = (
+        data["final_score"] >= threshold
+    ).astype(int)
+
+    actual = create_ground_truth(data)
+
+    precision = precision_score(
+        actual,
+        predictions,
+        zero_division=0
+    )
+
+    recall = recall_score(
+        actual,
+        predictions,
+        zero_division=0
+    )
+
+    f1 = f1_score(
+        actual,
+        predictions,
+        zero_division=0
+    )
+
+    false_positives = int(
+        ((predictions == 1) & (actual == 0)).sum()
+    )
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "false_positives": false_positives
+    }
+
+
+# ============================================================
+# 10. SELF-CORRECTION AGENT
+# ============================================================
+
+def self_correct(data):
+
+    candidate_thresholds = [
+        0.35,
+        0.45,
+        0.55,
+        0.65,
+        0.75
+    ]
+
+    evaluations = []
+
+    for threshold in candidate_thresholds:
+
+        metrics = evaluate_model(
+            data,
+            threshold
+        )
+
+        evaluations.append({
+            "threshold": threshold,
+            "precision": metrics["precision"],
+            "recall": metrics["recall"],
+            "f1": metrics["f1"],
+            "false_positives": metrics[
+                "false_positives"
+            ]
+        })
+
+    evaluation_df = pd.DataFrame(
+        evaluations
+    )
+
+    # Select threshold with highest F1 score
+    # If F1 is equal, choose fewer false positives
+    evaluation_df = evaluation_df.sort_values(
+        by=[
+            "f1",
+            "false_positives"
+        ],
+        ascending=[
+            False,
+            True
+        ]
+    )
+
+    best_threshold = float(
+        evaluation_df.iloc[0]["threshold"]
+    )
+
+    return best_threshold, evaluation_df
+
+
+# ============================================================
+# 11. STREAMLIT APPLICATION
+# ============================================================
+
+st.set_page_config(
+    page_title="GraphSentinel AI",
+    page_icon="🛡️",
+    layout="wide"
+)
+
+st.title(
+    "🛡️ GraphSentinel AI"
+)
+
+st.subheader(
+    "Self-Correcting Multi-Agent Anomaly Detection"
+)
+
+st.write(
+    """
+    This prototype combines temporal anomaly detection,
+    dynamic graph analysis, score fusion, investigation,
+    and automatic threshold correction.
+    """
+)
+
+
+# ============================================================
+# SIDEBAR SETTINGS
+# ============================================================
+
+st.sidebar.header(
+    "Configuration"
+)
+
+seed = st.sidebar.number_input(
+    "Random Seed",
+    min_value=1,
+    max_value=1000,
+    value=42
+)
+
+temporal_weight = st.sidebar.slider(
+    "Temporal Agent Weight",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.7,
+    step=0.1
+)
+
+manual_threshold = st.sidebar.slider(
+    "Manual Detection Threshold",
+    min_value=0.1,
+    max_value=1.0,
+    value=0.55,
+    step=0.05
+)
+
+
+# ============================================================
+# RUN PIPELINE
+# ============================================================
+
+if st.button("Run GraphSentinel"):
+
+    with st.spinner(
+        "Running multi-agent detection pipeline..."
+    ):
+
+        # Agent 1: Data generation
+        data = generate_data(
+            seed=int(seed)
+        )
+
+        # Agent 2: Temporal analysis
+        temporal_data = calculate_temporal_scores(
+            data
+        )
+
+        # Agent 3: Dynamic graph analysis
+        graph_data = generate_graph_features(
+            data,
+            seed=int(seed)
+        )
+
+        # Agent 4: Graph anomaly detection
+        graph_data = calculate_graph_scores(
+            graph_data
+        )
+
+        # Agent 5: Evidence fusion
+        combined_data = combine_scores(
+            temporal_data,
+            graph_data,
+            temporal_weight=float(
+                temporal_weight
+            )
+        )
+
+        # Agent 6: Self-correction
+        best_threshold, evaluation_df = (
+            self_correct(combined_data)
+        )
+
+        # Agent 7: Investigation
+        results = investigate_anomalies(
+            combined_data,
+            best_threshold
+        )
+
+        result_df = pd.DataFrame([
+            result.__dict__
+            for result in results
+        ])
+
+        # Evaluation
+        metrics = evaluate_model(
+            combined_data,
+            best_threshold
+        )
+
+    st.success(
+        "Pipeline completed successfully!"
+    )
+
+    # ========================================================
+    # METRICS
+    # ========================================================
+
+    st.header("Model Performance")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric(
+        "Precision",
+        f"{metrics['precision']:.3f}"
+    )
+
+    col2.metric(
+        "Recall",
+        f"{metrics['recall']:.3f}"
+    )
+
+    col3.metric(
+        "F1 Score",
+        f"{metrics['f1']:.3f}"
+    )
+
+    col4.metric(
+        "False Positives",
+        metrics["false_positives"]
+    )
+
+    st.info(
+        f"Self-corrected threshold: "
+        f"{best_threshold:.2f}"
+    )
+
+    # ========================================================
+    # TEMPORAL VISUALIZATION
+    # ========================================================
+
+    st.header("Temporal Data Visualization")
+
+    selected_node = st.selectbox(
+        "Select Node",
+        sorted(data["node"].unique())
+    )
+
+    node_data = combined_data[
+        combined_data["node"] == selected_node
+    ]
+
+    figure = px.line(
+        node_data,
+        x="timestamp",
+        y="value",
+        title=f"Time Series: {selected_node}"
+    )
+
+    st.plotly_chart(
+        figure,
+        use_container_width=True
+    )
+
+    # ========================================================
+    # ANOMALY TABLE
+    # ========================================================
+
+    st.header("Detected Anomalies")
+
+    anomalies = result_df[
+        result_df["is_anomaly"] == True
+    ]
+
+    if len(anomalies) > 0:
+
+        st.dataframe(
+            anomalies,
+            use_container_width=True
+        )
+
+    else:
+
+        st.success(
+            "No anomalies detected."
+        )
+
+    # ========================================================
+    # SELF-CORRECTION RESULTS
+    # ========================================================
+
+    st.header(
+        "Self-Correction Evaluation"
+    )
+
+    st.dataframe(
+        evaluation_df,
+        use_container_width=True
+    )
+
+    st.warning(
+        """
+        Note: This project currently uses synthetic
+        ground-truth labels. For a real research project,
+        replace them with independent verified labels
+        and proper train-validation-test splits.
+        """
+    )
